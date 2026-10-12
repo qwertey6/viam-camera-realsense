@@ -65,6 +65,24 @@ private:
   std::shared_ptr<rs2::align> align_to_color_;
 };
 
+// Turns a YUYV color frame into the RGB8 frame librealsense would have
+// produced when streaming RGB8, using librealsense's own converter, so a
+// request gets the same pixels either way. Any other frame is returned as is.
+// Like rs2::align it is not thread safe: use it under the device lock.
+class ColorDecoder {
+public:
+  ColorDecoder() : decoder_(std::make_shared<rs2::yuy_decoder>()) {}
+  rs2::video_frame toRgb(rs2::video_frame const &frame) {
+    if (frame.get_profile().format() != RS2_FORMAT_YUYV) {
+      return frame;
+    }
+    return decoder_->process(frame).as<rs2::video_frame>();
+  }
+
+private:
+  std::shared_ptr<rs2::yuy_decoder> decoder_;
+};
+
 template <typename DeviceT = rs2::device, typename PipeT = rs2::pipeline,
           typename AligntT = rs2::align, typename ConfigT = rs2::config>
 struct ViamRSDevice {
@@ -73,6 +91,7 @@ struct ViamRSDevice {
   bool started{false};
   std::shared_ptr<PipeT> pipe{};
   std::shared_ptr<PointCloudFilter> point_cloud_filter{};
+  std::shared_ptr<ColorDecoder> color_decoder{};
   std::shared_ptr<AligntT> align{};
   std::shared_ptr<ConfigT> config{};
 };

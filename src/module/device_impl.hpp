@@ -412,6 +412,33 @@ public:
   static constexpr rs2_format format_type = RS2_FORMAT_Z16;
 };
 
+// A D400 RGB sensor sends YUYV, and librealsense converts every frame of a
+// stream opened as RGB8 on the CPU, read or not. The color stream is chosen
+// by its RGB8 profile as before, then opened as YUYV when the sensor offers
+// that at the same stream index, size and rate; requests convert only the
+// frames they use (device::ColorDecoder).
+constexpr rs2_format kColorStreamFormat = RS2_FORMAT_YUYV;
+
+// The format to open the color stream chosen as `chosen` with: YUYV when one
+// of `profiles` is the same stream in YUYV, else chosen's own format.
+template <typename VideoStreamProfileT, typename ProfilesT>
+rs2_format colorStreamFormat(ProfilesT const &profiles,
+                             VideoStreamProfileT const &chosen) {
+  for (auto const &p : profiles) {
+    if (not p.template is<VideoStreamProfileT>()) {
+      continue;
+    }
+    auto vsp = p.template as<VideoStreamProfileT>();
+    if (vsp.format() == kColorStreamFormat and
+        vsp.stream_index() == chosen.stream_index() and
+        vsp.width() == chosen.width() and vsp.height() == chosen.height() and
+        vsp.fps() == chosen.fps()) {
+      return kColorStreamFormat;
+    }
+  }
+  return chosen.format();
+}
+
 template <typename DeviceT, typename ConfigT, typename SensorT,
           typename VideoStreamProfileT, typename ViamConfigT>
 std::shared_ptr<ConfigT>
@@ -465,9 +492,13 @@ createSingleSensorConfig(std::shared_ptr<DeviceT> dev,
         VIAM_DEVICE_LOG(logger, info)
             << "[createSingleSensorConfig] Found matching "
                "stream profile, enabling";
+        auto const format =
+            SensorTypeTraits<SensorT>::stream_type == RS2_STREAM_COLOR
+                ? colorStreamFormat(profiles, csp)
+                : csp.format();
         cfg->enable_stream(SensorTypeTraits<SensorT>::stream_type,
                            csp.stream_index(), csp.width(), csp.height(),
-                           csp.format(), csp.fps());
+                           format, csp.fps());
         VIAM_DEVICE_LOG(logger, info)
             << "[createSingleSensorConfig] enabled stream";
         return cfg;
@@ -497,6 +528,7 @@ std::shared_ptr<ConfigT> createSwD2CAlignConfig(std::shared_ptr<DeviceT> dev,
       std::decay_t<decltype(std::declval<typename SensorVectorT::value_type>()
                                 .get_stream_profiles())>;
   ProfileVectorT color_profiles;
+  ProfileVectorT color_stream_profiles; // the color sensors' YUYV profiles
   ProfileVectorT depth_profiles;
   for (auto &s : sensors) {
     enableGlobalTimestamp(s, logger);
@@ -512,6 +544,8 @@ std::shared_ptr<ConfigT> createSwD2CAlignConfig(std::shared_ptr<DeviceT> dev,
       if (vsp.format() == SensorTypeTraits<ColorSensorT>::format_type) {
         color_profiles.push_back(p);
         serves_color = true;
+      } else if (vsp.format() == kColorStreamFormat) {
+        color_stream_profiles.push_back(p);
       } else if (vsp.format() == SensorTypeTraits<DepthSensorT>::format_type) {
         depth_profiles.push_back(p);
         serves_depth = true;
@@ -544,7 +578,8 @@ std::shared_ptr<ConfigT> createSwD2CAlignConfig(std::shared_ptr<DeviceT> dev,
                "and depth stream profiles";
         cfg->enable_stream(SensorTypeTraits<ColorSensorT>::stream_type,
                            csp.stream_index(), csp.width(), csp.height(),
-                           csp.format(), csp.fps());
+                           colorStreamFormat(color_stream_profiles, csp),
+                           csp.fps());
         cfg->enable_stream(SensorTypeTraits<DepthSensorT>::stream_type,
                            dsp.stream_index(), dsp.width(), dsp.height(),
                            dsp.format(), dsp.fps());
@@ -646,6 +681,7 @@ bool destroyDevice(std::shared_ptr<boost::synchronized_value<ViamDeviceT>> &dev,
       device->config.reset();
       device->align.reset();
       device->point_cloud_filter.reset();
+      device->color_decoder.reset();
 
       VIAM_DEVICE_LOG(logger, info)
           << "[destroyDevice] device destroyed: " << device->serial_number;
@@ -721,6 +757,7 @@ createDevice(std::string const &serial_number, std::shared_ptr<DeviceT> dev,
   my_dev->device = dev;
   my_dev->serial_number = serial_number;
   my_dev->point_cloud_filter = std::make_shared<PointCloudFilter>();
+  my_dev->color_decoder = std::make_shared<ColorDecoder>();
   my_dev->align = std::make_shared<std::decay_t<decltype(*my_dev->align)>>(
       RS2_STREAM_COLOR);
   my_dev->config = config;

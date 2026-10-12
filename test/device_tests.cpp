@@ -11,7 +11,9 @@
 
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <vector>
 
@@ -1413,6 +1415,139 @@ TEST_F(DeviceTest,
       << "Should log that auto-exposure was disabled for color";
   EXPECT_TRUE(found_matching_profiles_log)
       << "Should log that matching profiles were found";
+}
+
+// A config that records the streams it is asked to enable, for the config
+// builders that construct their own ConfigT.
+struct EnabledStream {
+  rs2_stream stream;
+  int width, height, fps;
+  rs2_format format;
+};
+class RecordingConfig {
+public:
+  void enable_stream(rs2_stream stream, int /*stream_index*/, int width,
+                     int height, rs2_format format, int fps) {
+    enabled().push_back({stream, width, height, fps, format});
+  }
+  static std::vector<EnabledStream> &enabled() {
+    static std::vector<EnabledStream> streams;
+    return streams;
+  }
+};
+
+static SimpleStreamProfile profileOf(rs2_format format, int width, int height,
+                                     int fps) {
+  SimpleStreamProfile p;
+  p.format_ = format;
+  p.width_ = width;
+  p.height_ = height;
+  p.fps_ = fps;
+  p.stream_index_ = 0;
+  return p;
+}
+
+static SimpleSensor
+sensorWith(bool is_color, std::vector<SimpleStreamProfile> const &profiles) {
+  SimpleSensor sensor;
+  sensor.set_sensor_type(is_color, not is_color);
+  EXPECT_CALL(*sensor.mock(), supports(_))
+      .Times(::testing::AnyNumber())
+      .WillRepeatedly(Return(false));
+  sensor.set_stream_profiles(profiles);
+  return sensor;
+}
+
+static std::optional<EnabledStream> enabledStream(rs2_stream stream) {
+  for (auto const &e : RecordingConfig::enabled()) {
+    if (e.stream == stream) {
+      return e;
+    }
+  }
+  return std::nullopt;
+}
+
+// A D400 RGB sensor offers each mode as RGB8 (converted by librealsense on
+// every frame) and as the camera's own YUYV: the mode is chosen as before,
+// and the stream is opened as YUYV.
+TEST_F(DeviceTest, CreateSwD2CAlignConfig_OpensColorAsYuyvWhenOffered) {
+  viam::sdk::LogSource logger;
+  RecordingConfig::enabled().clear();
+  auto device = std::make_shared<SimpleDevice>();
+  device->set_sensors(
+      {sensorWith(true, {profileOf(RS2_FORMAT_YUYV, 1280, 720, 30),
+                         profileOf(RS2_FORMAT_RGB8, 640, 480, 30),
+                         profileOf(RS2_FORMAT_YUYV, 640, 480, 30)}),
+       sensorWith(false, {profileOf(RS2_FORMAT_Z16, 640, 480, 30)})});
+  RsResourceConfig viam_config("test_serial", "test_camera",
+                               {realsense::sensors::SensorType::color,
+                                realsense::sensors::SensorType::depth},
+                               std::nullopt, std::nullopt);
+
+  ASSERT_NE(
+      (createSwD2CAlignConfig<SimpleDevice, RecordingConfig, rs2::color_sensor,
+                              rs2::depth_sensor, SimpleVideoStreamProfile,
+                              RsResourceConfig>(device, viam_config, logger)),
+      nullptr);
+
+  auto color = enabledStream(RS2_STREAM_COLOR);
+  ASSERT_TRUE(color.has_value());
+  EXPECT_EQ(color->format, RS2_FORMAT_YUYV);
+  EXPECT_EQ(std::tuple(color->width, color->height, color->fps),
+            std::tuple(640, 480, 30));
+  auto depth = enabledStream(RS2_STREAM_DEPTH);
+  ASSERT_TRUE(depth.has_value());
+  EXPECT_EQ(depth->format, RS2_FORMAT_Z16);
+}
+
+// Without YUYV at the chosen mode, the color stream stays RGB8.
+TEST_F(DeviceTest, CreateSwD2CAlignConfig_KeepsRgb8WithoutYuyvAtThatMode) {
+  viam::sdk::LogSource logger;
+  RecordingConfig::enabled().clear();
+  auto device = std::make_shared<SimpleDevice>();
+  device->set_sensors(
+      {sensorWith(true, {profileOf(RS2_FORMAT_RGB8, 640, 480, 30),
+                         profileOf(RS2_FORMAT_YUYV, 640, 480, 15)}),
+       sensorWith(false, {profileOf(RS2_FORMAT_Z16, 640, 480, 30)})});
+  RsResourceConfig viam_config("test_serial", "test_camera",
+                               {realsense::sensors::SensorType::color,
+                                realsense::sensors::SensorType::depth},
+                               std::nullopt, std::nullopt);
+
+  ASSERT_NE(
+      (createSwD2CAlignConfig<SimpleDevice, RecordingConfig, rs2::color_sensor,
+                              rs2::depth_sensor, SimpleVideoStreamProfile,
+                              RsResourceConfig>(device, viam_config, logger)),
+      nullptr);
+
+  auto color = enabledStream(RS2_STREAM_COLOR);
+  ASSERT_TRUE(color.has_value());
+  EXPECT_EQ(color->format, RS2_FORMAT_RGB8);
+  EXPECT_EQ(color->fps, 30);
+}
+
+TEST_F(DeviceTest, CreateSingleSensorConfig_OpensColorAsYuyvWhenOffered) {
+  viam::sdk::LogSource logger;
+  RecordingConfig::enabled().clear();
+  auto device = std::make_shared<SimpleDevice>();
+  device->set_sensors(
+      {sensorWith(true, {profileOf(RS2_FORMAT_RGB8, 640, 480, 30),
+                         profileOf(RS2_FORMAT_YUYV, 640, 480, 30)})});
+  RsResourceConfig viam_config(
+      "test_serial", "test_camera", {realsense::sensors::SensorType::color},
+      std::optional<int>{640}, std::optional<int>{480});
+
+  ASSERT_NE(
+      (createSingleSensorConfig<SimpleDevice, RecordingConfig,
+                                rs2::color_sensor, SimpleVideoStreamProfile,
+                                RsResourceConfig>(device, viam_config, logger)),
+      nullptr);
+
+  auto color = enabledStream(RS2_STREAM_COLOR);
+  ASSERT_TRUE(color.has_value());
+  EXPECT_EQ(color->format, RS2_FORMAT_YUYV);
+  EXPECT_EQ(std::tuple(color->width, color->height, color->fps),
+            std::tuple(640, 480, 30));
 }
 
 // Helper: a SimpleDevice with one color sensor whose only stream profile

@@ -627,7 +627,7 @@ public:
           }
           auto color = fs.get_color_frame();
           response.images.emplace_back(
-              encoding::encodeVideoFrameToResponse(color));
+              encoding::encodeVideoFrameToResponse(rgbColor(color)));
           std::uint64_t timestamp =
               static_cast<std::uint64_t>(std::llround(color.get_timestamp()));
 
@@ -716,6 +716,23 @@ public:
                                std::string(e.what()));
     }
   }
+  // The color frame as RGB8. A YUYV stream (see device::kColorStreamFormat)
+  // is converted here, for the frames requests use, instead of by
+  // librealsense for every frame.
+  rs2::video_frame rgbColor(rs2::video_frame const &color) {
+    if (color.get_profile().format() != RS2_FORMAT_YUYV) {
+      return color;
+    }
+    if (not device_) {
+      throw std::runtime_error("no device available to convert color");
+    }
+    auto my_dev = device_->synchronize();
+    if (not my_dev->color_decoder) {
+      throw std::runtime_error("device has no color decoder");
+    }
+    return my_dev->color_decoder->toRgb(color);
+  }
+
   viam::sdk::Camera::point_cloud
   get_point_cloud(std::string mime_type,
                   const viam::sdk::ProtoStruct &extra) override {
@@ -774,8 +791,11 @@ public:
           throw std::runtime_error("device is not started");
         }
 
-        data = encoding::encodeRGBPointsToPCD(
-            my_dev->point_cloud_filter->process(fs), this->logger_);
+        auto cloud = my_dev->point_cloud_filter->process(fs);
+        if (my_dev->color_decoder) {
+          cloud.second = my_dev->color_decoder->toRgb(cloud.second);
+        }
+        data = encoding::encodeRGBPointsToPCD(std::move(cloud), this->logger_);
       } // End scope for my_dev lock
 
       if (data.size() > MAX_GRPC_MESSAGE_SIZE) {

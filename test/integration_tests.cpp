@@ -43,6 +43,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -101,10 +102,15 @@ struct SoftwareCameraSpec {
   rs2_intrinsics depth_intrinsics{pinholeIntrinsics()};
   rs2_intrinsics color_intrinsics{pinholeIntrinsics()};
   rs2_extrinsics depth_to_color{identityExtrinsics()};
+  // RGB8: one RGB8 color stream. YUYV: like a real D400 RGB sensor, color is
+  // offered as RGB8 and as YUYV at the same mode, and only YUYV frames are
+  // fed, so frames arrive only if the module opens the YUYV stream.
+  rs2_format color_format{RS2_FORMAT_RGB8};
 };
 
-// A software D4xx: two sensors, one Z16 depth stream and one RGB8 color
-// stream at the same resolution and frame rate, plus the depth options the
+// A software D4xx: two sensors, one Z16 depth stream and a color stream (see
+// SoftwareCameraSpec::color_format) at the same resolution and frame rate,
+// plus the depth options the
 // module reads and writes. Frames are injected from a feeder thread with
 // wall clock timestamps so the module's staleness checks behave as they do
 // with a real camera.
@@ -113,7 +119,8 @@ public:
   explicit SoftwareCamera(SoftwareCameraSpec spec)
       : spec_(std::move(spec)), depth_sensor_(dev_.add_sensor("Stereo Module")),
         color_sensor_(dev_.add_sensor("RGB Camera")), depth_(kWidth * kHeight),
-        color_(kWidth * kHeight * 3) {
+        color_bpp_(spec_.color_format == RS2_FORMAT_YUYV ? 2 : 3),
+        color_(kWidth * kHeight * color_bpp_) {
     dev_.register_info(RS2_CAMERA_INFO_NAME, spec_.name);
     dev_.register_info(RS2_CAMERA_INFO_SERIAL_NUMBER, spec_.serial);
     dev_.register_info(RS2_CAMERA_INFO_FIRMWARE_VERSION, "5.16.0.1");
@@ -129,6 +136,13 @@ public:
     color_profile_ = color_sensor_.add_video_stream(
         {RS2_STREAM_COLOR, 0, 1, kWidth, kHeight, kFps, 3, RS2_FORMAT_RGB8,
          spec_.color_intrinsics});
+    if (spec_.color_format == RS2_FORMAT_YUYV) {
+      depth_profile_.register_extrinsics_to(color_profile_,
+                                            spec_.depth_to_color);
+      color_profile_ = color_sensor_.add_video_stream(
+          {RS2_STREAM_COLOR, 0, 2, kWidth, kHeight, kFps, 2, RS2_FORMAT_YUYV,
+           spec_.color_intrinsics});
+    }
 
     // DEPTH_UNITS is also what makes the sensor cast to rs2::depth_sensor.
     depth_sensor_.add_read_only_option(RS2_OPTION_DEPTH_UNITS, kDepthUnits);
@@ -146,10 +160,23 @@ public:
     for (int y = 0; y < kHeight; ++y) {
       for (int x = 0; x < kWidth; ++x) {
         depth_[y * kWidth + x] = depthAt(x, y);
-        auto rgb = colorAt(x, y);
-        color_[(y * kWidth + x) * 3 + 0] = rgb[0];
-        color_[(y * kWidth + x) * 3 + 1] = rgb[1];
-        color_[(y * kWidth + x) * 3 + 2] = rgb[2];
+        if (color_bpp_ == 3) {
+          auto rgb = colorAt(x, y);
+          color_[(y * kWidth + x) * 3 + 0] = rgb[0];
+          color_[(y * kWidth + x) * 3 + 1] = rgb[1];
+          color_[(y * kWidth + x) * 3 + 2] = rgb[2];
+        }
+      }
+      if (color_bpp_ == 2) {
+        // colorAt in limited-range BT.601 YUYV: Y per pixel, U and V per pair
+        for (int x = 0; x < kWidth; x += 2) {
+          auto a = colorAt(x, y), b = colorAt(x + 1, y);
+          auto *out = &color_[(y * kWidth + x) * 2];
+          out[0] = lumaOf(a);
+          out[1] = static_cast<std::uint8_t>((chromaU(a) + chromaU(b) + 1) / 2);
+          out[2] = lumaOf(b);
+          out[3] = static_cast<std::uint8_t>((chromaV(a) + chromaV(b) + 1) / 2);
+        }
       }
     }
   }
@@ -182,8 +209,9 @@ public:
                                       2, ts, RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME,
                                       frame_number, depth_profile_.get(),
                                       kDepthUnits});
-        color_sensor_.on_video_frame({color_.data(), [](void *) {}, kWidth * 3,
-                                      3, ts, RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME,
+        color_sensor_.on_video_frame({color_.data(), [](void *) {},
+                                      kWidth * color_bpp_, color_bpp_, ts,
+                                      RS2_TIMESTAMP_DOMAIN_SYSTEM_TIME,
                                       frame_number, color_profile_.get(), 0.f});
         ++frame_number;
         std::this_thread::sleep_for(std::chrono::milliseconds(1000 / kFps));
@@ -213,6 +241,16 @@ public:
   SoftwareCameraSpec const &spec() const { return spec_; }
 
 private:
+  static int lumaOf(std::array<std::uint8_t, 3> const &c) {
+    return ((66 * c[0] + 129 * c[1] + 25 * c[2] + 128) >> 8) + 16;
+  }
+  static int chromaU(std::array<std::uint8_t, 3> const &c) {
+    return ((-38 * c[0] - 74 * c[1] + 112 * c[2] + 128) >> 8) + 128;
+  }
+  static int chromaV(std::array<std::uint8_t, 3> const &c) {
+    return ((112 * c[0] - 94 * c[1] - 18 * c[2] + 128) >> 8) + 128;
+  }
+
   void addOption(rs2_option opt, float min, float max, float def, float step) {
     rs2::option_range range{};
     range.min = min;
@@ -229,6 +267,7 @@ private:
   rs2::stream_profile depth_profile_;
   rs2::stream_profile color_profile_;
   std::vector<std::uint16_t> depth_;
+  int color_bpp_;
   std::vector<std::uint8_t> color_;
   std::vector<rs2::device_list> keepalive_;
   std::atomic<bool> feeding_{false};
@@ -302,6 +341,25 @@ struct JpegHeader {
     return h;
   }
 };
+
+// Decodes a JPEG to tightly packed RGB8; empty on failure.
+std::vector<std::uint8_t> decodeRgb(std::vector<std::uint8_t> const &bytes) {
+  auto header = JpegHeader::parse(bytes);
+  std::vector<std::uint8_t> rgb(static_cast<std::size_t>(header.width) *
+                                header.height * 3);
+  tjhandle tj = tjInitDecompress();
+  if (tj == nullptr or rgb.empty()) {
+    ADD_FAILURE() << "cannot decode JPEG";
+    return {};
+  }
+  if (tjDecompress2(tj, bytes.data(), bytes.size(), rgb.data(), header.width, 0,
+                    header.height, TJPF_RGB, 0) != 0) {
+    ADD_FAILURE() << tjGetErrorStr();
+    rgb.clear();
+  }
+  tjDestroy(tj);
+  return rgb;
+}
 
 struct PcdPoint {
   float x, y, z;
@@ -552,6 +610,30 @@ TEST_F(SoftwareDeviceTest, GetImages_WithoutAlignReturnsRawDepth) {
   EXPECT_EQ(map.at(kWidth / 2, kHeight / 2), kUniformDepthMm);
 }
 
+// The camera's own YUYV color stream is opened as YUYV (the fixture feeds
+// only YUYV frames) and converted to RGB for the frames requests use; the
+// colors must come out as they went in, within the error of limited-range
+// YUV with shared chroma and of the JPEG.
+TEST_F(SoftwareDeviceTest, GetImages_YuyvColorStreamReturnsItsColors) {
+  SoftwareCameraSpec spec;
+  spec.color_format = RS2_FORMAT_YUYV;
+  auto &rs = streamingResource(spec);
+
+  auto rgb = decodeRgb(findImage(rs.get_images({"color"}, {}), "color").bytes);
+  ASSERT_EQ(rgb.size(), static_cast<std::size_t>(kWidth * kHeight * 3));
+  double total = 0;
+  for (int y = 0; y < kHeight; ++y) {
+    for (int x = 0; x < kWidth; ++x) {
+      auto want = SoftwareCamera::colorAt(x, y);
+      for (int c = 0; c < 3; ++c) {
+        total += std::abs(int{rgb[(y * kWidth + x) * 3 + c]} - int{want[c]});
+      }
+    }
+  }
+  EXPECT_LT(total / (kWidth * kHeight * 3), 3.0)
+      << "mean absolute error per channel";
+}
+
 // ---- get_point_cloud ----
 
 TEST_F(SoftwareDeviceTest, GetPointCloud_ReturnsPcdMatchingInjectedGeometry) {
@@ -581,6 +663,25 @@ TEST_F(SoftwareDeviceTest, GetPointCloud_ReturnsPcdMatchingInjectedGeometry) {
     std::uint32_t expected =
         (std::uint32_t{rgb[0]} << 16) | (std::uint32_t{rgb[1]} << 8) | rgb[2];
     EXPECT_EQ(p.rgb, expected) << "pixel " << u << "," << v;
+  }
+}
+
+TEST_F(SoftwareDeviceTest, GetPointCloud_YuyvColorStreamCarriesItsColors) {
+  SoftwareCameraSpec spec;
+  spec.color_format = RS2_FORMAT_YUYV;
+  auto &rs = streamingResource(spec);
+
+  auto pcd = Pcd::parse(rs.get_point_cloud("pointcloud/pcd", {}).pc);
+  ASSERT_EQ(pcd.points, static_cast<std::size_t>(kWidth * kHeight));
+  for (auto [u, v] : {std::pair{0, 0}, std::pair{kWidth / 2, kHeight / 2},
+                      std::pair{37, 101}, std::pair{kWidth - 1, kHeight - 1}}) {
+    auto rgb = pcd.at(static_cast<std::size_t>(v) * kWidth + u).rgb;
+    auto want = SoftwareCamera::colorAt(u, v);
+    EXPECT_NEAR(int((rgb >> 16) & 0xff), want[0], 4)
+        << "pixel " << u << "," << v;
+    EXPECT_NEAR(int((rgb >> 8) & 0xff), want[1], 4)
+        << "pixel " << u << "," << v;
+    EXPECT_NEAR(int(rgb & 0xff), want[2], 4) << "pixel " << u << "," << v;
   }
 }
 
